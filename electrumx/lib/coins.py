@@ -1897,3 +1897,22 @@ class Monoeci(Coin):
                 '''Given a header return the hash.'''
                 import x11_hash
                 return x11_hash.getPoWHash(header)
+
+class Flo(Coin):
+    NAME = "Flo"
+    SHORTNAME = "FLO"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("0134406b")
+    XPRV_VERBYTES = bytes.fromhex("01343c31")
+    P2PKH_VERBYTE = bytes.fromhex("23")
+    P2SH_VERBYTES = [bytes.fromhex("08")]
+    WIF_BYTE = bytes.fromhex("b0")
+    GENESIS_HASH = ('09c7781c9df90708e278c35d38ea5c9041d7ecfcdd1c56ba67274b7cff3e1cea')
+    TX_COUNT = 8908766
+    TX_COUNT_HEIGHT = 1105256
+    TX_PER_BLOCK = 10
+    RPC_PORT = 7313
+    REORG_LIMIT = 800
+    PEERS = [
+    ]
+    DESERIALIZER = lib_tx.DeserializerFlo
