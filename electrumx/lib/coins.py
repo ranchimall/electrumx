@@ -1899,14 +1899,14 @@ class Monoeci(Coin):
                 return x11_hash.getPoWHash(header)
 
 class Flo(Coin):
-    NAME = "Flo"
+    NAME = "FLO"
     SHORTNAME = "FLO"
     NET = "mainnet"
     XPUB_VERBYTES = bytes.fromhex("0134406b")
     XPRV_VERBYTES = bytes.fromhex("01343c31")
     P2PKH_VERBYTE = bytes.fromhex("23")
     P2SH_VERBYTES = [bytes.fromhex("08")]
-    WIF_BYTE = bytes.fromhex("b0")
+    WIF_BYTE = bytes.fromhex("a3")
     GENESIS_HASH = ('09c7781c9df90708e278c35d38ea5c9041d7ecfcdd1c56ba67274b7cff3e1cea')
     TX_COUNT = 8908766
     TX_COUNT_HEIGHT = 1105256
@@ -1916,3 +1916,22 @@ class Flo(Coin):
     PEERS = [
     ]
     DESERIALIZER = lib_tx.DeserializerFlo
+
+
+class FloTestnet(Flo):
+    SHORTNAME = "XFL"
+    NET = "testnet"
+    XPUB_VERBYTES = bytes.fromhex("013440e2")
+    XPRV_VERBYTES = bytes.fromhex("01343c23")
+    P2PKH_VERBYTE = bytes.fromhex("73")
+    P2SH_VERBYTES = bytes.fromhex("c6")
+    WIF_BYTE = bytes.fromhex("ef")
+    GENESIS_HASH = ('9b7bc86236c34b5e3a39367c036b7fe8807a966c22a7a1f0da2a198a27e03731')
+    TX_COUNT = 21772
+    TX_COUNT_HEIGHT = 20800
+    TX_PER_BLOCK = 2
+    RPC_PORT = 17313
+    REORG_LIMIT = 4000
+    PEER_DEFAULT_PORTS = {'t': '51001', 's': '51002'}
+    PEERS = [
+    ]
