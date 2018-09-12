@@ -11,12 +11,13 @@
 import array
 import ast
 import bisect
+import time
 from collections import defaultdict
 from functools import partial
-from struct import pack, unpack
 
 import electrumx.lib.util as util
-from electrumx.lib.hash import hash_to_str, HASHX_LEN
+from electrumx.lib.util import pack_be_uint16, unpack_be_uint16_from
+from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 
 
 class History(object):
@@ -31,10 +32,14 @@ class History(object):
         self.unflushed_count = 0
         self.db = None
 
-    def open_db(self, db_class, for_sync, utxo_flush_count):
+    def open_db(self, db_class, for_sync, utxo_flush_count, compacting):
         self.db = db_class('hist', for_sync)
         self.read_state()
         self.clear_excess(utxo_flush_count)
+        # An incomplete compaction needs to be cancelled otherwise
+        # restarting it will corrupt the history
+        if not compacting:
+            self._cancel_compaction()
         return self.flush_count
 
     def close_db(self):
@@ -58,12 +63,12 @@ class History(object):
             self.comp_cursor = -1
             self.db_version = max(self.DB_VERSIONS)
 
-        self.logger.info(f'flush count: {self.flush_count:,d}')
         self.logger.info(f'history DB version: {self.db_version}')
         if self.db_version not in self.DB_VERSIONS:
             msg = f'this software only handles DB versions {self.DB_VERSIONS}'
             self.logger.error(msg)
             raise RuntimeError(msg)
+        self.logger.info(f'flush count: {self.flush_count:,d}')
 
     def clear_excess(self, utxo_flush_count):
         # < might happen at end of compaction as both DBs cannot be
@@ -76,11 +81,11 @@ class History(object):
 
         keys = []
         for key, hist in self.db.iterator(prefix=b''):
-            flush_id, = unpack('>H', key[-2:])
+            flush_id, = unpack_be_uint16_from(key[-2:])
             if flush_id > utxo_flush_count:
                 keys.append(key)
 
-        self.logger.info('deleting {:,d} history entries'.format(len(keys)))
+        self.logger.info(f'deleting {len(keys):,d} history entries')
 
         self.flush_count = utxo_flush_count
         with self.db.write_batch() as batch:
@@ -119,8 +124,9 @@ class History(object):
         assert not self.unflushed
 
     def flush(self):
+        start_time = time.time()
         self.flush_count += 1
-        flush_id = pack('>H', self.flush_count)
+        flush_id = pack_be_uint16(self.flush_count)
         unflushed = self.unflushed
 
         with self.db.write_batch() as batch:
@@ -132,7 +138,11 @@ class History(object):
         count = len(unflushed)
         unflushed.clear()
         self.unflushed_count = 0
-        return count
+
+        if self.db.for_sync:
+            elapsed = time.time() - start_time
+            self.logger.info(f'flushed history in {elapsed:.1f}s '
+                             f'for {count:,d} addrs')
 
     def backup(self, hashXs, tx_count):
         # Not certain this is needed, but it doesn't hurt
@@ -161,7 +171,7 @@ class History(object):
                     batch.put(key, value)
             self.write_state(batch)
 
-        return nremoves
+        self.logger.info(f'backing up removed {nremoves:,d} history entries')
 
     def get_txnums(self, hashX, limit=1000):
         '''Generator that returns an unpruned, sorted list of tx_nums in the
@@ -230,8 +240,8 @@ class History(object):
         if nrows > 4:
             self.logger.info('hashX {} is large: {:,d} entries across '
                              '{:,d} rows'
-                             .format(hash_to_str(hashX), len(full_hist) // 4,
-                                     nrows))
+                             .format(hash_to_hex_str(hashX),
+                                     len(full_hist) // 4, nrows))
 
         # Find what history needs to be written, and what keys need to
         # be deleted.  Start by assuming all keys are to be deleted,
@@ -240,7 +250,7 @@ class History(object):
         write_size = 0
         keys_to_delete.update(hist_map)
         for n, chunk in enumerate(util.chunks(full_hist, max_row_size)):
-            key = hashX + pack('>H', n)
+            key = hashX + pack_be_uint16(n)
             if hist_map.get(key) == chunk:
                 keys_to_delete.remove(key)
             else:
@@ -292,7 +302,7 @@ class History(object):
         # Loop over 2-byte prefixes
         cursor = self.comp_cursor
         while write_size < limit and cursor < 65536:
-            prefix = pack('>H', cursor)
+            prefix = pack_be_uint16(cursor)
             write_size += self._compact_prefix(prefix, write_items,
                                                keys_to_delete)
             cursor += 1
@@ -307,7 +317,7 @@ class History(object):
                                  100 * cursor / 65536))
         return write_size
 
-    def cancel_compaction(self):
+    def _cancel_compaction(self):
         if self.comp_cursor != -1:
             self.logger.warning('cancelling in-progress history compaction')
             self.comp_flush_count = -1

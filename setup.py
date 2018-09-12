@@ -1,8 +1,8 @@
 import setuptools
-version = '1.5.1'
+version = '1.8.5'
 
 setuptools.setup(
-    name='electrumX-kyuupichan',
+    name='electrumX',
     version=version,
     scripts=['electrumx_server', 'electrumx_rpc'],
     python_requires='>=3.6',
@@ -11,7 +11,9 @@ setuptools.setup(
     # "tribus_hash" package is required to sync Denarius network.
     # "blake256" package is required to sync Decred network.
     # "xevan_hash" package is required to sync Xuez network.
-    install_requires=['aiorpcX >= 0.5.6', 'plyvel', 'pylru', 'aiohttp >= 1'],
+    # "groestlcoin_hash" package is required to sync Groestlcoin network.
+    install_requires=['aiorpcX>=0.7.3,<0.8', 'attrs',
+                      'plyvel', 'pylru', 'aiohttp >= 2'],
     packages=setuptools.find_packages(include=('electrumx*',)),
     description='ElectrumX Server',
     author='Neil Booth',

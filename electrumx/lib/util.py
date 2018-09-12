@@ -168,20 +168,6 @@ def int_to_bytes(value):
     return value.to_bytes((value.bit_length() + 7) // 8, 'big')
 
 
-def int_to_varint(value):
-    '''Converts an integer to a Bitcoin-like varint bytes'''
-    if value < 0:
-        raise ValueError("attempt to write size < 0")
-    elif value < 253:
-        return pack('<B', value)
-    elif value < 2**16:
-        return b'\xfd' + pack('<H', value)
-    elif value < 2**32:
-        return b'\xfe' + pack('<I', value)
-    elif value < 2**64:
-        return b'\xff' + pack('<Q', value)
-
-
 def increment_byte_string(bs):
     '''Return the lexicographically next byte string of the same length.
 
@@ -304,35 +290,70 @@ def version_string(ptuple):
     return '.'.join(str(p) for p in ptuple)
 
 
-def protocol_version(client_req, server_min, server_max):
-    '''Given a client protocol request, return the protocol version
-    to use as a tuple.
+def protocol_version(client_req, min_tuple, max_tuple):
+    '''Given a client's protocol version string, return a pair of
+    protocol tuples:
 
-    If a mutually acceptable protocol version does not exist, return None.
+           (negotiated version, client min request)
+
+    If the request is unsupported, the negotiated protocol tuple is
+    None.
     '''
-    if isinstance(client_req, list) and len(client_req) == 2:
-        client_min, client_max = client_req
-    elif client_req is None:
-        client_min = client_max = server_min
+    if client_req is None:
+        client_min = client_max = min_tuple
     else:
-        client_min = client_max = client_req
+        if isinstance(client_req, list) and len(client_req) == 2:
+            client_min, client_max = client_req
+        else:
+            client_min = client_max = client_req
+        client_min = protocol_tuple(client_min)
+        client_max = protocol_tuple(client_max)
 
-    client_min = protocol_tuple(client_min)
-    client_max = protocol_tuple(client_max)
-    server_min = protocol_tuple(server_min)
-    server_max = protocol_tuple(server_max)
-
-    result = min(client_max, server_max)
-    if result < max(client_min, server_min) or result == (0, ):
+    result = min(client_max, max_tuple)
+    if result < max(client_min, min_tuple) or result == (0, ):
         result = None
 
-    return result
+    return result, client_min
 
 
-unpack_int32_from = Struct('<i').unpack_from
-unpack_int64_from = Struct('<q').unpack_from
-unpack_uint16_from = Struct('<H').unpack_from
-unpack_uint32_from = Struct('<I').unpack_from
-unpack_uint64_from = Struct('<Q').unpack_from
+struct_le_i = Struct('<i')
+struct_le_q = Struct('<q')
+struct_le_H = Struct('<H')
+struct_le_I = Struct('<I')
+struct_le_Q = Struct('<Q')
+struct_be_H = Struct('>H')
+struct_be_I = Struct('>I')
+structB = Struct('B')
+
+unpack_le_int32_from = struct_le_i.unpack_from
+unpack_le_int64_from = struct_le_q.unpack_from
+unpack_le_uint16_from = struct_le_H.unpack_from
+unpack_le_uint32_from = struct_le_I.unpack_from
+unpack_le_uint64_from = struct_le_Q.unpack_from
+unpack_be_uint16_from = struct_be_H.unpack_from
+unpack_be_uint32_from = struct_be_I.unpack_from
+
+pack_le_int32 = struct_le_i.pack
+pack_le_int64 = struct_le_q.pack
+pack_le_uint16 = struct_le_H.pack
+pack_le_uint32 = struct_le_I.pack
+pack_le_uint64 = struct_le_Q.pack
+pack_be_uint16 = struct_be_H.pack
+pack_be_uint32 = struct_be_I.pack
+pack_byte = structB.pack
 
 hex_to_bytes = bytes.fromhex
+
+
+def pack_varint(n):
+    if n < 253:
+        return pack_byte(n)
+    if n < 65536:
+        return pack_byte(253) + pack_le_uint16(n)
+    if n < 4294967296:
+        return pack_byte(254) + pack_le_uint32(n)
+    return pack_byte(255) + pack_le_uint64(n)
+
+
+def pack_varbytes(data):
+    return pack_varint(len(data)) + data

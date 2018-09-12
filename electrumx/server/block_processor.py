@@ -15,18 +15,24 @@ from struct import pack, unpack
 import time
 from functools import partial
 
+from aiorpcx import TaskGroup, run_in_thread
+
+import electrumx
 from electrumx.server.daemon import DaemonError
-from electrumx.lib.hash import hash_to_str, HASHX_LEN
-from electrumx.lib.util import chunks, formatted_time, class_logger
-import electrumx.server.db
+from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
+from electrumx.lib.util import chunks, class_logger
+from electrumx.server.db import FlushData
 
 
 class Prefetcher(object):
     '''Prefetches blocks (in the forward direction only).'''
 
-    def __init__(self, bp):
+    def __init__(self, daemon, coin, blocks_event):
         self.logger = class_logger(__name__, self.__class__.__name__)
-        self.bp = bp
+        self.daemon = daemon
+        self.coin = coin
+        self.blocks_event = blocks_event
+        self.blocks = []
         self.caught_up = False
         # Access to fetched_height should be protected by the semaphore
         self.fetched_height = None
@@ -39,8 +45,9 @@ class Prefetcher(object):
         # This makes the first fetch be 10 blocks
         self.ave_size = self.min_cache_size // 10
 
-    async def main_loop(self):
+    async def main_loop(self, bp_height):
         '''Loop forever polling for more blocks.'''
+        await self.reset_height(bp_height)
         while True:
             try:
                 # Sleep a while if there is nothing to prefetch
@@ -48,26 +55,31 @@ class Prefetcher(object):
                 if not await self._prefetch_blocks():
                     await asyncio.sleep(5)
             except DaemonError as e:
-                self.logger.info('ignoring daemon error: {}'.format(e))
+                self.logger.info(f'ignoring daemon error: {e}')
 
-    def processing_blocks(self, blocks):
+    def get_prefetched_blocks(self):
         '''Called by block processor when it is processing queued blocks.'''
-        self.cache_size -= sum(len(block) for block in blocks)
-        if self.cache_size < self.min_cache_size:
-            self.refill_event.set()
+        blocks = self.blocks
+        self.blocks = []
+        self.cache_size = 0
+        self.refill_event.set()
+        return blocks
 
-    async def reset_height(self):
+    async def reset_height(self, height):
         '''Reset to prefetch blocks from the block processor's height.
 
         Used in blockchain reorganisations.  This coroutine can be
-        called asynchronously to the _prefetch coroutine so we must
-        synchronize with a semaphore.'''
+        called asynchronously to the _prefetch_blocks coroutine so we
+        must synchronize with a semaphore.
+        '''
         async with self.semaphore:
-            self.fetched_height = self.bp.height
+            self.blocks.clear()
+            self.cache_size = 0
+            self.fetched_height = height
             self.refill_event.set()
 
-        daemon_height = await self.bp.daemon.height()
-        behind = daemon_height - self.bp.height
+        daemon_height = await self.daemon.height()
+        behind = daemon_height - height
         if behind > 0:
             self.logger.info('catching up to daemon height {:,d} '
                              '({:,d} blocks behind)'
@@ -81,8 +93,8 @@ class Prefetcher(object):
 
         Repeats until the queue is full or caught up.
         '''
-        daemon = self.bp.daemon
-        daemon_height = await daemon.height(self.bp.caught_up_event.is_set())
+        daemon = self.daemon
+        daemon_height = await daemon.height()
         async with self.semaphore:
             while self.cache_size < self.min_cache_size:
                 # Try and catch up all blocks but limit to room in cache.
@@ -92,9 +104,7 @@ class Prefetcher(object):
                 count = min(daemon_height - self.fetched_height, cache_room)
                 count = min(500, max(count, 0))
                 if not count:
-                    if not self.caught_up:
-                        self.caught_up = True
-                        self.bp.on_prefetcher_first_caught_up()
+                    self.caught_up = True
                     return False
 
                 first = self.fetched_height + 1
@@ -108,7 +118,7 @@ class Prefetcher(object):
 
                 # Special handling for genesis block
                 if first == 0:
-                    blocks[0] = self.bp.coin.genesis_block(blocks[0])
+                    blocks[0] = self.coin.genesis_block(blocks[0])
                     self.logger.info('verified genesis block with hash {}'
                                      .format(hex_hashes[0]))
 
@@ -119,9 +129,10 @@ class Prefetcher(object):
                 else:
                     self.ave_size = (size + (10 - count) * self.ave_size) // 10
 
-                self.bp.on_prefetched_blocks(blocks, first)
+                self.blocks.extend(blocks)
                 self.cache_size += size
                 self.fetched_height += count
+                self.blocks_event.set()
 
         self.refill_event.clear()
         return True
@@ -131,39 +142,28 @@ class ChainError(Exception):
     '''Raised on error processing blocks.'''
 
 
-class BlockProcessor(electrumx.server.db.DB):
+class BlockProcessor(object):
     '''Process blocks and update the DB state to match.
 
     Employ a prefetcher to prefetch blocks in batches for processing.
     Coordinate backing up in case of chain reorganisations.
     '''
 
-    def __init__(self, env, controller, daemon):
-        super().__init__(env)
-
-        # An incomplete compaction needs to be cancelled otherwise
-        # restarting it will corrupt the history
-        self.history.cancel_compaction()
-
+    def __init__(self, env, db, daemon, notifications):
+        self.env = env
+        self.db = db
         self.daemon = daemon
-        self.controller = controller
+        self.notifications = notifications
 
-        # These are our state as we move ahead of DB state
-        self.fs_height = self.db_height
-        self.fs_tx_count = self.db_tx_count
-        self.height = self.db_height
-        self.tip = self.db_tip
-        self.tx_count = self.db_tx_count
-
-        self.caught_up_event = asyncio.Event()
-        self.task_queue = asyncio.Queue()
+        self.coin = env.coin
+        self.blocks_event = asyncio.Event()
+        self.prefetcher = Prefetcher(daemon, env.coin, self.blocks_event)
+        self.logger = class_logger(__name__, self.__class__.__name__)
 
         # Meta
-        self.cache_MB = env.cache_MB
         self.next_cache_check = 0
-        self.last_flush = time.time()
-        self.last_flush_tx_count = self.tx_count
         self.touched = set()
+        self.reorg_count = 0
 
         # Caches of unflushed items.
         self.headers = []
@@ -174,67 +174,28 @@ class BlockProcessor(electrumx.server.db.DB):
         self.utxo_cache = {}
         self.db_deletes = []
 
-        self.prefetcher = Prefetcher(self)
+        # If the lock is successfully acquired, in-memory chain state
+        # is consistent with self.height
+        self.state_lock = asyncio.Lock()
 
-        if self.utxo_db.for_sync:
-            self.logger.info('flushing DB cache at {:,d} MB'
-                             .format(self.cache_MB))
+    async def run_in_thread_with_lock(self, func, *args):
+        # Run in a thread to prevent blocking.  Shielded so that
+        # cancellations from shutdown don't lose work - when the task
+        # completes the data will be flushed and then we shut down.
+        # Take the state lock to be certain in-memory state is
+        # consistent and not being updated elsewhere.
+        async def run_in_thread_locked():
+            async with self.state_lock:
+                return await run_in_thread(func, *args)
+        return await asyncio.shield(run_in_thread_locked())
 
-    def add_task(self, task):
-        '''Add the task to our task queue.'''
-        self.task_queue.put_nowait(task)
-
-    def on_prefetched_blocks(self, blocks, first):
-        '''Called by the prefetcher when it has prefetched some blocks.'''
-        self.add_task(partial(self.check_and_advance_blocks, blocks, first))
-
-    def on_prefetcher_first_caught_up(self):
-        '''Called by the prefetcher when it first catches up.'''
-        self.add_task(self.first_caught_up)
-
-    async def main_loop(self):
-        '''Main loop for block processing.'''
-        self.controller.create_task(self.prefetcher.main_loop())
-        await self.prefetcher.reset_height()
-
-        while True:
-            task = await self.task_queue.get()
-            await task()
-
-    def shutdown(self, executor):
-        '''Shutdown cleanly and flush to disk.'''
-        # First stut down the executor; it may be processing a block.
-        # Then we can flush anything remaining to disk.
-        executor.shutdown()
-        if self.height != self.db_height:
-            self.logger.info('flushing state to DB for a clean shutdown...')
-            self.flush(True)
-
-    async def first_caught_up(self):
-        '''Called when first caught up to daemon after starting.'''
-        # Flush everything with updated first_sync->False state.
-        self.first_sync = False
-        await self.controller.run_in_executor(self.flush, True)
-        if self.utxo_db.for_sync:
-            self.logger.info(f'{self.controller.VERSION} synced to '
-                             f'height {self.height:,d}')
-        self.open_dbs()
-        self.caught_up_event.set()
-
-    async def check_and_advance_blocks(self, raw_blocks, first):
+    async def check_and_advance_blocks(self, raw_blocks):
         '''Process the list of raw blocks passed.  Detects and handles
         reorgs.
         '''
-        self.prefetcher.processing_blocks(raw_blocks)
-        if first != self.height + 1:
-            # If we prefetched two sets of blocks and the first caused
-            # a reorg this will happen when we try to process the
-            # second.  It should be very rare.
-            self.logger.warning('ignoring {:,d} blocks starting height {:,d}, '
-                                'expected {:,d}'.format(len(raw_blocks), first,
-                                                        self.height + 1))
+        if not raw_blocks:
             return
-
+        first = self.height + 1
         blocks = [self.coin.block(raw_block, first + n)
                   for n, raw_block in enumerate(raw_blocks)]
         headers = [block.header for block in blocks]
@@ -243,14 +204,16 @@ class BlockProcessor(electrumx.server.db.DB):
 
         if hprevs == chain:
             start = time.time()
-            await self.controller.run_in_executor(self.advance_blocks, blocks)
-            if not self.first_sync:
+            await self.run_in_thread_with_lock(self.advance_blocks, blocks)
+            await self._maybe_flush()
+            if not self.db.first_sync:
                 s = '' if len(blocks) == 1 else 's'
                 self.logger.info('processed {:,d} block{} in {:.1f}s'
                                  .format(len(blocks), s,
                                          time.time() - start))
-                self.controller.mempool.on_new_block(self.touched)
-            self.touched.clear()
+            if self._caught_up_event.is_set():
+                await self.notifications.on_block(self.touched, self.height)
+            self.touched = set()
         elif hprevs[0] != chain[0]:
             await self.reorg_chain()
         else:
@@ -261,17 +224,7 @@ class BlockProcessor(electrumx.server.db.DB):
             # just to reset the prefetcher and try again.
             self.logger.warning('daemon blocks do not form a chain; '
                                 'resetting the prefetcher')
-            await self.prefetcher.reset_height()
-
-    def force_chain_reorg(self, count):
-        '''Force a reorg of the given number of blocks.
-
-        Returns True if a reorg is queued, false if not caught up.
-        '''
-        if self.caught_up_event.is_set():
-            self.add_task(partial(self.reorg_chain, count=count))
-            return True
-        return False
+            await self.prefetcher.reset_height(self.height)
 
     async def reorg_chain(self, count=None):
         '''Handle a chain reorganisation.
@@ -281,21 +234,51 @@ class BlockProcessor(electrumx.server.db.DB):
         if count is None:
             self.logger.info('chain reorg detected')
         else:
-            self.logger.info('faking a reorg of {:,d} blocks'.format(count))
-        await self.controller.run_in_executor(self.flush, True)
+            self.logger.info(f'faking a reorg of {count:,d} blocks')
+        await self.flush(True)
 
-        hashes = await self.reorg_hashes(count)
+        async def get_raw_blocks(last_height, hex_hashes):
+            heights = range(last_height, last_height - len(hex_hashes), -1)
+            try:
+                blocks = [self.read_raw_block(height) for height in heights]
+                self.logger.info(f'read {len(blocks)} blocks from disk')
+                return blocks
+            except Exception:
+                return await self.daemon.raw_blocks(hex_hashes)
+
+        def flush_backup():
+            # self.touched can include other addresses which is
+            # harmless, but remove None.
+            self.touched.discard(None)
+            self.db.flush_backup(self.flush_data(), self.touched)
+
+        start, last, hashes = await self.reorg_hashes(count)
         # Reverse and convert to hex strings.
-        hashes = [hash_to_str(hash) for hash in reversed(hashes)]
+        hashes = [hash_to_hex_str(hash) for hash in reversed(hashes)]
         for hex_hashes in chunks(hashes, 50):
-            blocks = await self.daemon.raw_blocks(hex_hashes)
-            await self.controller.run_in_executor(self.backup_blocks, blocks)
-        await self.prefetcher.reset_height()
+            raw_blocks = await get_raw_blocks(last, hex_hashes)
+            await self.run_in_thread_with_lock(self.backup_blocks, raw_blocks)
+            await self.run_in_thread_with_lock(flush_backup)
+            last -= len(raw_blocks)
+        await self.prefetcher.reset_height(self.height)
 
     async def reorg_hashes(self, count):
-        '''Return the list of hashes to back up beacuse of a reorg.
+        '''Return a pair (start, last, hashes) of blocks to back up during a
+        reorg.
 
-        The hashes are returned in order of increasing height.'''
+        The hashes are returned in order of increasing height.  Start
+        is the height of the first hash, last of the last.
+        '''
+        start, count = await self.calc_reorg_range(count)
+        last = start + count - 1
+        s = '' if count == 1 else 's'
+        self.logger.info(f'chain was reorganised replacing {count:,d} '
+                         f'block{s} at heights {start:,d}-{last:,d}')
+
+        return start, last, await self.db.fs_block_hashes(start, count)
+
+    async def calc_reorg_range(self, count):
+        '''Calculate the reorg range'''
 
         def diff_pos(hashes1, hashes2):
             '''Returns the index of the first difference in the hash lists.
@@ -310,8 +293,8 @@ class BlockProcessor(electrumx.server.db.DB):
             start = self.height - 1
             count = 1
             while start > 0:
-                hashes = self.fs_block_hashes(start, count)
-                hex_hashes = [hash_to_str(hash) for hash in hashes]
+                hashes = await self.db.fs_block_hashes(start, count)
+                hex_hashes = [hash_to_hex_str(hash) for hash in hashes]
                 d_hex_hashes = await self.daemon.block_hex_hashes(start, count)
                 n = diff_pos(hex_hashes, d_hex_hashes)
                 if n > 0:
@@ -324,140 +307,42 @@ class BlockProcessor(electrumx.server.db.DB):
         else:
             start = (self.height - count) + 1
 
-        s = '' if count == 1 else 's'
-        self.logger.info('chain was reorganised replacing {:,d} block{} at '
-                         'heights {:,d}-{:,d}'
-                         .format(count, s, start, start + count - 1))
+        return start, count
 
-        return self.fs_block_hashes(start, count)
+    def estimate_txs_remaining(self):
+        # Try to estimate how many txs there are to go
+        daemon_height = self.daemon.cached_height()
+        coin = self.coin
+        tail_count = daemon_height - max(self.height, coin.TX_COUNT_HEIGHT)
+        # Damp the initial enthusiasm
+        realism = max(2.0 - 0.9 * self.height / coin.TX_COUNT_HEIGHT, 1.0)
+        return (tail_count * coin.TX_PER_BLOCK +
+                max(coin.TX_COUNT - self.tx_count, 0)) * realism
 
-    def flush_state(self, batch):
-        '''Flush chain state to the batch.'''
-        now = time.time()
-        self.wall_time += now - self.last_flush
-        self.last_flush = now
-        self.last_flush_tx_count = self.tx_count
-        self.write_utxo_state(batch)
+    # - Flushing
+    def flush_data(self):
+        '''The data for a flush.  The lock must be taken.'''
+        assert self.state_lock.locked()
+        return FlushData(self.height, self.tx_count, self.headers,
+                         self.tx_hashes, self.undo_infos, self.utxo_cache,
+                         self.db_deletes, self.tip)
 
-    def assert_flushed(self):
-        '''Asserts state is fully flushed.'''
-        assert self.tx_count == self.fs_tx_count == self.db_tx_count
-        assert self.height == self.fs_height == self.db_height
-        assert not self.undo_infos
-        assert not self.utxo_cache
-        assert not self.db_deletes
-        self.history.assert_flushed()
+    async def flush(self, flush_utxos):
+        def flush():
+            self.db.flush_dbs(self.flush_data(), flush_utxos,
+                              self.estimate_txs_remaining)
+        await self.run_in_thread_with_lock(flush)
 
-    def flush(self, flush_utxos=False):
-        '''Flush out cached state.
-
-        History is always flushed.  UTXOs are flushed if flush_utxos.'''
-        if self.height == self.db_height:
-            self.assert_flushed()
-            return
-
-        flush_start = time.time()
-        last_flush = self.last_flush
-        tx_diff = self.tx_count - self.last_flush_tx_count
-
-        # Flush to file system
-        self.fs_flush()
-        fs_end = time.time()
-        if self.utxo_db.for_sync:
-            self.logger.info('flushed to FS in {:.1f}s'
-                             .format(fs_end - flush_start))
-
-        # History next - it's fast and frees memory
-        hashX_count = self.history.flush()
-        if self.utxo_db.for_sync:
-            self.logger.info('flushed history in {:.1f}s for {:,d} addrs'
-                             .format(time.time() - fs_end, hashX_count))
-
-        # Flush state last as it reads the wall time.
-        with self.utxo_db.write_batch() as batch:
-            if flush_utxos:
-                self.flush_utxos(batch)
-            self.flush_state(batch)
-
-        # Update and put the wall time again - otherwise we drop the
-        # time it took to commit the batch
-        self.flush_state(self.utxo_db)
-
-        self.logger.info('flush #{:,d} took {:.1f}s.  Height {:,d} txs: {:,d}'
-                         .format(self.history.flush_count,
-                                 self.last_flush - flush_start,
-                                 self.height, self.tx_count))
-
-        # Catch-up stats
-        if self.utxo_db.for_sync:
-            tx_per_sec = int(self.tx_count / self.wall_time)
-            this_tx_per_sec = 1 + int(tx_diff / (self.last_flush - last_flush))
-            self.logger.info('tx/sec since genesis: {:,d}, '
-                             'since last flush: {:,d}'
-                             .format(tx_per_sec, this_tx_per_sec))
-
-            daemon_height = self.daemon.cached_height()
-            if self.height > self.coin.TX_COUNT_HEIGHT:
-                tx_est = (daemon_height - self.height) * self.coin.TX_PER_BLOCK
-            else:
-                tx_est = ((daemon_height - self.coin.TX_COUNT_HEIGHT)
-                          * self.coin.TX_PER_BLOCK
-                          + (self.coin.TX_COUNT - self.tx_count))
-
-            # Damp the enthusiasm
-            realism = 2.0 - 0.9 * self.height / self.coin.TX_COUNT_HEIGHT
-            tx_est *= max(realism, 1.0)
-
-            self.logger.info('sync time: {}  ETA: {}'
-                             .format(formatted_time(self.wall_time),
-                                     formatted_time(tx_est / this_tx_per_sec)))
-
-    def fs_flush(self):
-        '''Flush the things stored on the filesystem.'''
-        assert self.fs_height + len(self.headers) == self.height
-        assert self.tx_count == self.tx_counts[-1] if self.tx_counts else 0
-
-        self.fs_update(self.fs_height, self.headers, self.tx_hashes)
-        self.fs_height = self.height
-        self.fs_tx_count = self.tx_count
-        self.tx_hashes = []
-        self.headers = []
-
-    def backup_flush(self):
-        '''Like flush() but when backing up.  All UTXOs are flushed.
-
-        hashXs - sequence of hashXs which were touched by backing
-        up.  Searched for history entries to remove after the backup
-        height.
-        '''
-        assert self.height < self.db_height
-        self.history.assert_flushed()
-
-        flush_start = time.time()
-
-        # Backup FS (just move the pointers back)
-        self.fs_height = self.height
-        self.fs_tx_count = self.tx_count
-        assert not self.headers
-        assert not self.tx_hashes
-
-        # Backup history.  self.touched can include other addresses
-        # which is harmless, but remove None.
-        self.touched.discard(None)
-        nremoves = self.history.backup(self.touched, self.tx_count)
-        self.logger.info('backing up removed {:,d} history entries'
-                         .format(nremoves))
-
-        with self.utxo_db.write_batch() as batch:
-            # Flush state last as it reads the wall time.
-            self.flush_utxos(batch)
-            self.flush_state(batch)
-
-        self.logger.info('backup flush #{:,d} took {:.1f}s.  '
-                         'Height {:,d} txs: {:,d}'
-                         .format(self.history.flush_count,
-                                 self.last_flush - flush_start,
-                                 self.height, self.tx_count))
+    async def _maybe_flush(self):
+        # If caught up, flush everything as client queries are
+        # performed on the DB.
+        if self._caught_up_event.is_set():
+            await self.flush(True)
+        elif time.time() > self.next_cache_check:
+            flush_arg = self.check_cache_size()
+            if flush_arg is not None:
+                await self.flush(flush_arg)
+            self.next_cache_check = time.time() + 30
 
     def check_cache_size(self):
         '''Flush a cache if it gets too big.'''
@@ -466,10 +351,10 @@ class BlockProcessor(electrumx.server.db.DB):
         one_MB = 1000*1000
         utxo_cache_size = len(self.utxo_cache) * 205
         db_deletes_size = len(self.db_deletes) * 57
-        hist_cache_size = self.history.unflushed_memsize()
+        hist_cache_size = self.db.history.unflushed_memsize()
         # Roughly ntxs * 32 + nblocks * 42
-        tx_hash_size = ((self.tx_count - self.fs_tx_count) * 32
-                        + (self.height - self.fs_height) * 42)
+        tx_hash_size = ((self.tx_count - self.db.fs_tx_count) * 32
+                        + (self.height - self.db.fs_height) * 42)
         utxo_MB = (db_deletes_size + utxo_cache_size) // one_MB
         hist_MB = (hist_cache_size + tx_hash_size) // one_MB
 
@@ -480,15 +365,17 @@ class BlockProcessor(electrumx.server.db.DB):
 
         # Flush history if it takes up over 20% of cache memory.
         # Flush UTXOs once they take up 80% of cache memory.
-        if utxo_MB + hist_MB >= self.cache_MB or hist_MB >= self.cache_MB // 5:
-            self.flush(utxo_MB >= self.cache_MB * 4 // 5)
+        cache_MB = self.env.cache_MB
+        if utxo_MB + hist_MB >= cache_MB or hist_MB >= cache_MB // 5:
+            return utxo_MB >= cache_MB * 4 // 5
+        return None
 
     def advance_blocks(self, blocks):
         '''Synchronously advance the blocks.
 
         It is already verified they correctly connect onto our tip.
         '''
-        min_height = self.min_undo_height(self.daemon.cached_height())
+        min_height = self.db.min_undo_height(self.daemon.cached_height())
         height = self.height
 
         for block in blocks:
@@ -496,20 +383,12 @@ class BlockProcessor(electrumx.server.db.DB):
             undo_info = self.advance_txs(block.transactions)
             if height >= min_height:
                 self.undo_infos.append((undo_info, height))
+                self.db.write_raw_block(block.raw, height)
 
         headers = [block.header for block in blocks]
         self.height = height
         self.headers.extend(headers)
         self.tip = self.coin.header_hash(headers[-1])
-
-        # If caught up, flush everything as client queries are
-        # performed on the DB.
-        if self.caught_up_event.is_set():
-            self.flush(True)
-        else:
-            if time.time() > self.next_cache_check:
-                self.check_cache_size()
-                self.next_cache_check = time.time() + 30
 
     def advance_txs(self, txs):
         self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
@@ -532,11 +411,12 @@ class BlockProcessor(electrumx.server.db.DB):
             tx_numb = s_pack('<I', tx_num)
 
             # Spend the inputs
-            if not tx.is_coinbase:
-                for txin in tx.inputs:
-                    cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
-                    undo_info_append(cache_value)
-                    append_hashX(cache_value[:-12])
+            for txin in tx.inputs:
+                if txin.is_generation():
+                    continue
+                cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
+                undo_info_append(cache_value)
+                append_hashX(cache_value[:-12])
 
             # Add the new UTXOs
             for idx, txout in enumerate(tx.outputs):
@@ -551,10 +431,10 @@ class BlockProcessor(electrumx.server.db.DB):
             update_touched(hashXs)
             tx_num += 1
 
-        self.history.add_unflushed(hashXs_by_tx, self.tx_count)
+        self.db.history.add_unflushed(hashXs_by_tx, self.tx_count)
 
         self.tx_count = tx_num
-        self.tx_counts.append(tx_num)
+        self.db.tx_counts.append(tx_num)
 
         return undo_info
 
@@ -564,7 +444,7 @@ class BlockProcessor(electrumx.server.db.DB):
         The blocks should be in order of decreasing height, starting at.
         self.height.  A flush is performed once the blocks are backed up.
         '''
-        self.assert_flushed()
+        self.db.assert_flushed(self.flush_data())
         assert self.height >= len(raw_blocks)
 
         coin = self.coin
@@ -574,20 +454,20 @@ class BlockProcessor(electrumx.server.db.DB):
             header_hash = coin.header_hash(block.header)
             if header_hash != self.tip:
                 raise ChainError('backup block {} not tip {} at height {:,d}'
-                                 .format(hash_to_str(header_hash),
-                                         hash_to_str(self.tip), self.height))
+                                 .format(hash_to_hex_str(header_hash),
+                                         hash_to_hex_str(self.tip),
+                                         self.height))
             self.tip = coin.header_prevhash(block.header)
             self.backup_txs(block.transactions)
             self.height -= 1
-            self.tx_counts.pop()
+            self.db.tx_counts.pop()
 
         self.logger.info('backed up to height {:,d}'.format(self.height))
-        self.backup_flush()
 
     def backup_txs(self, txs):
         # Prevout values, in order down the block (coinbase first if present)
         # undo_info is in reverse block order
-        undo_info = self.read_undo_info(self.height)
+        undo_info = self.db.read_undo_info(self.height)
         if undo_info is None:
             raise ChainError('no undo information found for height {:,d}'
                              .format(self.height))
@@ -611,13 +491,14 @@ class BlockProcessor(electrumx.server.db.DB):
                     touched.add(cache_value[:-12])
 
             # Restore the inputs
-            if not tx.is_coinbase:
-                for txin in reversed(tx.inputs):
-                    n -= undo_entry_len
-                    undo_item = undo_info[n:n + undo_entry_len]
-                    put_utxo(txin.prev_hash + s_pack('<H', txin.prev_idx),
-                             undo_item)
-                    touched.add(undo_item[:-12])
+            for txin in reversed(tx.inputs):
+                if txin.is_generation():
+                    continue
+                n -= undo_entry_len
+                undo_item = undo_info[n:n + undo_entry_len]
+                put_utxo(txin.prev_hash + s_pack('<H', txin.prev_idx),
+                         undo_item)
+                touched.add(undo_item[:-12])
 
         assert n == 0
         self.tx_count -= len(txs)
@@ -695,14 +576,14 @@ class BlockProcessor(electrumx.server.db.DB):
         # Value: hashX
         prefix = b'h' + tx_hash[:4] + idx_packed
         candidates = {db_key: hashX for db_key, hashX
-                      in self.utxo_db.iterator(prefix=prefix)}
+                      in self.db.utxo_db.iterator(prefix=prefix)}
 
         for hdb_key, hashX in candidates.items():
             tx_num_packed = hdb_key[-4:]
 
             if len(candidates) > 1:
                 tx_num, = unpack('<I', tx_num_packed)
-                hash, height = self.fs_tx_hash(tx_num)
+                hash, height = self.db.fs_tx_hash(tx_num)
                 if hash != tx_hash:
                     assert hash is not None  # Should always be found
                     continue
@@ -710,7 +591,7 @@ class BlockProcessor(electrumx.server.db.DB):
             # Key: b'u' + address_hashX + tx_idx + tx_num
             # Value: the UTXO value as a 64-bit unsigned integer
             udb_key = b'u' + hashX + hdb_key[-6:]
-            utxo_value_packed = self.utxo_db.get(udb_key)
+            utxo_value_packed = self.db.utxo_db.get(udb_key)
             if utxo_value_packed:
                 # Remove both entries for this UTXO
                 self.db_deletes.append(hdb_key)
@@ -718,46 +599,86 @@ class BlockProcessor(electrumx.server.db.DB):
                 return hashX + tx_num_packed + utxo_value_packed
 
         raise ChainError('UTXO {} / {:,d} not found in "h" table'
-                         .format(hash_to_str(tx_hash), tx_idx))
+                         .format(hash_to_hex_str(tx_hash), tx_idx))
 
-    def flush_utxos(self, batch):
-        '''Flush the cached DB writes and UTXO set to the batch.'''
-        # Care is needed because the writes generated by flushing the
-        # UTXO state may have keys in common with our write cache or
-        # may be in the DB already.
-        flush_start = time.time()
-        delete_count = len(self.db_deletes) // 2
-        utxo_cache_len = len(self.utxo_cache)
+    async def _process_prefetched_blocks(self):
+        '''Loop forever processing blocks as they arrive.'''
+        while True:
+            if self.height == self.daemon.cached_height():
+                if not self._caught_up_event.is_set():
+                    await self._first_caught_up()
+                    self._caught_up_event.set()
+            await self.blocks_event.wait()
+            self.blocks_event.clear()
+            if self.reorg_count:
+                await self.reorg_chain(self.reorg_count)
+                self.reorg_count = 0
+            else:
+                blocks = self.prefetcher.get_prefetched_blocks()
+                await self.check_and_advance_blocks(blocks)
 
-        # Spends
-        batch_delete = batch.delete
-        for key in sorted(self.db_deletes):
-            batch_delete(key)
-        self.db_deletes = []
+    async def _first_caught_up(self):
+        self.logger.info(f'caught up to height {self.height}')
+        # Flush everything but with first_sync->False state.
+        first_sync = self.db.first_sync
+        self.db.first_sync = False
+        await self.flush(True)
+        if first_sync:
+            self.logger.info(f'{electrumx.version} synced to '
+                             f'height {self.height:,d}')
+        # Initialise the notification framework
+        await self.notifications.on_block(set(), self.height)
+        # Reopen for serving
+        await self.db.open_for_serving()
 
-        # New UTXOs
-        batch_put = batch.put
-        for cache_key, cache_value in self.utxo_cache.items():
-            # suffix = tx_idx + tx_num
-            hashX = cache_value[:-12]
-            suffix = cache_key[-2:] + cache_value[-12:-8]
-            batch_put(b'h' + cache_key[:4] + suffix, hashX)
-            batch_put(b'u' + hashX + suffix, cache_value[-8:])
-        self.utxo_cache = {}
+    async def _first_open_dbs(self):
+        await self.db.open_for_sync()
+        self.height = self.db.db_height
+        self.tip = self.db.db_tip
+        self.tx_count = self.db.db_tx_count
 
-        # New undo information
-        self.flush_undo_infos(batch_put, self.undo_infos)
-        self.undo_infos = []
+    # --- External API
 
-        if self.utxo_db.for_sync:
-            self.logger.info('flushed {:,d} blocks with {:,d} txs, {:,d} UTXO '
-                             'adds, {:,d} spends in {:.1f}s, committing...'
-                             .format(self.height - self.db_height,
-                                     self.tx_count - self.db_tx_count,
-                                     utxo_cache_len, delete_count,
-                                     time.time() - flush_start))
+    async def fetch_and_process_blocks(self, caught_up_event):
+        '''Fetch, process and index blocks from the daemon.
 
-        self.utxo_flush_count = self.history.flush_count
-        self.db_tx_count = self.tx_count
-        self.db_height = self.height
-        self.db_tip = self.tip
+        Sets caught_up_event when first caught up.  Flushes to disk
+        and shuts down cleanly if cancelled.
+
+        This is mainly because if, during initial sync ElectrumX is
+        asked to shut down when a large number of blocks have been
+        processed but not written to disk, it should write those to
+        disk before exiting, as otherwise a significant amount of work
+        could be lost.
+        '''
+        self._caught_up_event = caught_up_event
+        await self._first_open_dbs()
+        try:
+            async with TaskGroup() as group:
+                await group.spawn(self.prefetcher.main_loop(self.height))
+                await group.spawn(self._process_prefetched_blocks())
+        finally:
+            # Shut down block processing
+            self.logger.info('flushing to DB for a clean shutdown...')
+            await self.flush(True)
+
+    def force_chain_reorg(self, count):
+        '''Force a reorg of the given number of blocks.
+
+        Returns True if a reorg is queued, false if not caught up.
+        '''
+        if self._caught_up_event.is_set():
+            self.reorg_count = count
+            self.blocks_event.set()
+            return True
+        return False
+
+
+class DecredBlockProcessor(BlockProcessor):
+    async def calc_reorg_range(self, count):
+        start, count = await super().calc_reorg_range(count)
+        if start > 0:
+            # A reorg in Decred can invalidate the previous block
+            start -= 1
+            count += 1
+        return start, count
