@@ -602,7 +602,6 @@ class DeserializerDecred(Deserializer):
 class TxFlo(namedtuple("Tx", "version inputs outputs locktime txcomment")):
     '''Class representing a transaction.'''
 
-    @cachedproperty
     def is_coinbase(self):
         return self.inputs[0].is_coinbase
 
@@ -611,7 +610,6 @@ class TxFloSegWit(namedtuple("Tx", "version marker flag inputs outputs "
                                    "witness locktime txcomment")):
     '''Class representing a SegWit transaction.'''
 
-    @cachedproperty
     def is_coinbase(self):
         return self.inputs[0].is_coinbase
 
