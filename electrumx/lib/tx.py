@@ -28,6 +28,7 @@
 '''Transaction-related classes and functions.'''
 
 from collections import namedtuple
+from hashlib import blake2s
 
 from electrumx.lib.hash import sha256, double_sha256, hash_to_hex_str
 from electrumx.lib.script import OpCodes
@@ -320,26 +321,47 @@ class TxJoinSplit(namedtuple("Tx", "version inputs outputs locktime")):
 class DeserializerZcash(DeserializerEquihash):
     def read_tx(self):
         header = self._read_le_uint32()
-        overwinterd = ((header >> 31) == 1)
-        if overwinterd:
+        overwintered = ((header >> 31) == 1)
+        if overwintered:
             version = header & 0x7fffffff
-            self._read_le_uint32()  # versionGroupId
+            self.cursor += 4  # versionGroupId
         else:
             version = header
+
+        is_overwinter_v3 = version == 3
+        is_sapling_v4 = version == 4
+
         base_tx = TxJoinSplit(
             version,
             self._read_inputs(),    # inputs
             self._read_outputs(),   # outputs
             self._read_le_uint32()  # locktime
         )
-        if base_tx.version >= 3:
-            self._read_le_uint32()  # expiryHeight
+
+        if is_overwinter_v3 or is_sapling_v4:
+            self.cursor += 4  # expiryHeight
+
+        has_shielded = False
+        if is_sapling_v4:
+            self.cursor += 8  # valueBalance
+            shielded_spend_size = self._read_varint()
+            self.cursor += shielded_spend_size * 384  # vShieldedSpend
+            shielded_output_size = self._read_varint()
+            self.cursor += shielded_output_size * 948  # vShieldedOutput
+            has_shielded = shielded_spend_size > 0 or shielded_output_size > 0
+
         if base_tx.version >= 2:
             joinsplit_size = self._read_varint()
             if joinsplit_size > 0:
-                self.cursor += joinsplit_size * 1802  # JSDescription
+                joinsplit_desc_len = 1506 + (192 if is_sapling_v4 else 296)
+                # JSDescription
+                self.cursor += joinsplit_size * joinsplit_desc_len
                 self.cursor += 32  # joinSplitPubKey
                 self.cursor += 64  # joinSplitSig
+
+        if is_sapling_v4 and has_shielded:
+            self.cursor += 64  # bindingSig
+
         return base_tx
 
 
@@ -356,6 +378,62 @@ class DeserializerTxTime(Deserializer):
             self._read_outputs(),    # outputs
             self._read_le_uint32(),  # locktime
         )
+
+
+class TxTrezarcoin(
+        namedtuple("Tx", "version time inputs outputs locktime txcomment")):
+    '''Class representing transaction that has a time and txcomment field.'''
+
+
+class DeserializerTrezarcoin(Deserializer):
+
+    def read_tx(self):
+        version = self._read_le_int32()
+        time = self._read_le_uint32()
+        inputs = self._read_inputs()
+        outputs = self._read_outputs()
+        locktime = self._read_le_uint32()
+        if version >= 2:
+            txcomment = self._read_varbytes()
+        else:
+            txcomment = b''
+        return TxTrezarcoin(version, time, inputs, outputs, locktime,
+                            txcomment)
+
+    @staticmethod
+    def blake2s_gen(data):
+        version = data[0:1]
+        keyOne = data[36:46]
+        keyTwo = data[58:68]
+        ntime = data[68:72]
+        _nBits = data[72:76]
+        _nonce = data[76:80]
+        _full_merkle = data[36:68]
+        _input112 = data + _full_merkle
+        _key = keyTwo + ntime + _nBits + _nonce + keyOne
+        '''Prepare 112Byte Header '''
+        blake2s_hash = blake2s(key=_key, digest_size=32)
+        blake2s_hash.update(_input112)
+        '''TrezarFlips - Only for Genesis'''
+        return ''.join(map(str.__add__, blake2s_hash.hexdigest()[-2::-2],
+                           blake2s_hash.hexdigest()[-1::-2]))
+
+    @staticmethod
+    def blake2s(data):
+        version = data[0:1]
+        keyOne = data[36:46]
+        keyTwo = data[58:68]
+        ntime = data[68:72]
+        _nBits = data[72:76]
+        _nonce = data[76:80]
+        _full_merkle = data[36:68]
+        _input112 = data + _full_merkle
+        _key = keyTwo + ntime + _nBits + _nonce + keyOne
+        '''Prepare 112Byte Header '''
+        blake2s_hash = blake2s(key=_key, digest_size=32)
+        blake2s_hash.update(_input112)
+        '''TrezarFlips'''
+        return blake2s_hash.digest()
 
 
 class DeserializerReddcoin(Deserializer):
@@ -500,6 +578,10 @@ class TxInputDcr(namedtuple("TxInput", "prev_hash prev_idx tree sequence")):
         return ("Input({}, {:d}, tree={}, sequence={:d})"
                 .format(prev_hash, self.prev_idx, self.tree, self.sequence))
 
+    def is_generation(self):
+        '''Test if an input is generation/coinbase like'''
+        return self.prev_idx == MINUS_1 and self.prev_hash == ZERO
+
 
 class TxOutputDcr(namedtuple("TxOutput", "value version pk_script")):
     '''Class representing a Decred transaction output.'''
@@ -599,6 +681,7 @@ class DeserializerDecred(Deserializer):
             witness
         ), tx_hash, self.cursor - start
 
+
 class TxFlo(namedtuple("Tx", "version inputs outputs locktime txcomment")):
     '''Class representing a transaction.'''
 
@@ -671,3 +754,18 @@ class DeserializerFlo(DeserializerSegWit):
 
         return TxFloSegWit(version, marker, flag, inputs, outputs, witness,
                            locktime, tx_comment), double_sha256(orig_ser), vsize
+
+
+class DeserializerSmartCash(Deserializer):
+
+    @staticmethod
+    def keccak(data):
+        from Cryptodome.Hash import keccak
+        keccak_hash = keccak.new(digest_bits=256)
+        keccak_hash.update(data)
+        return keccak_hash.digest()
+
+    def read_tx_and_hash(self):
+        from electrumx.lib.hash import sha256
+        start = self.cursor
+        return self.read_tx(), sha256(self.binary[start:self.cursor])
