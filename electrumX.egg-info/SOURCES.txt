@@ -1,4 +1,5 @@
 README.rst
+electrumx_compact_history
 electrumx_rpc
 electrumx_server
 setup.py
@@ -19,6 +20,8 @@ electrumx/lib/script.py
 electrumx/lib/server_base.py
 electrumx/lib/text.py
 electrumx/lib/tx.py
+electrumx/lib/tx_axe.py
+electrumx/lib/tx_dash.py
 electrumx/lib/util.py
 electrumx/server/__init__.py
 electrumx/server/block_processor.py
